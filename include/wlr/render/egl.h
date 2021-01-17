@@ -70,6 +70,7 @@ struct wlr_egl {
 		PFNEGLDEBUGMESSAGECONTROLKHRPROC eglDebugMessageControlKHR;
 		PFNEGLQUERYDISPLAYATTRIBEXTPROC eglQueryDisplayAttribEXT;
 		PFNEGLQUERYDEVICESTRINGEXTPROC eglQueryDeviceStringEXT;
+		PFNEGLQUERYDEVICESEXTPROC eglQueryDevicesEXT;
 	} procs;
 
 	struct wl_display *wl_display;
@@ -79,12 +80,12 @@ struct wlr_egl {
 };
 
 /**
- * Initializes an EGL context for the given platform and remote display.
+ * Initializes an EGL context for the given platform and drm file descriptor.
  * Will attempt to load all possibly required api functions.
  *
  * If config_attribs is NULL, the EGL config is not created.
  */
-struct wlr_egl *wlr_egl_create(EGLenum platform, void *remote_display,
+struct wlr_egl *wlr_egl_create(EGLenum platform, int drm_fd,
 	const EGLint *config_attribs);
 
 /**

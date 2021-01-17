@@ -11,6 +11,8 @@
 #include <wlr/util/region.h>
 #include <xf86drm.h>
 
+static bool device_has_name(const drmDevice *device, const char *name);
+
 static enum wlr_log_importance egl_log_importance_to_wlr(EGLint type) {
 	switch (type) {
 	case EGL_DEBUG_MSG_CRITICAL_KHR: return WLR_ERROR;
@@ -150,7 +152,7 @@ out:
 	free(formats);
 }
 
-struct wlr_egl *wlr_egl_create(EGLenum platform, void *remote_display,
+struct wlr_egl *wlr_egl_create(EGLenum platform, int drm_fd,
 		const EGLint *config_attribs) {
 	struct wlr_egl *egl = calloc(1, sizeof(struct wlr_egl));
 	if (egl == NULL) {
@@ -167,6 +169,8 @@ struct wlr_egl *wlr_egl_create(EGLenum platform, void *remote_display,
 		}
 		return NULL;
 	}
+
+	wlr_log(WLR_INFO, "Supported EGL client extensions: %s", client_exts_str);
 
 	if (!check_egl_ext(client_exts_str, "EGL_EXT_platform_base")) {
 		wlr_log(WLR_ERROR, "EGL_EXT_platform_base not supported");
@@ -196,8 +200,74 @@ struct wlr_egl *wlr_egl_create(EGLenum platform, void *remote_display,
 		goto error;
 	}
 
-	egl->display = egl->procs.eglGetPlatformDisplayEXT(platform,
-		remote_display, NULL);
+	const char *device_exts_str = NULL;
+	if (!check_egl_ext(client_exts_str, "EGL_EXT_device_enumeration")) {
+
+	}
+	load_egl_proc(&egl->procs.eglQueryDeviceStringEXT,
+		"eglQueryDeviceStringEXT");
+	load_egl_proc(&egl->procs.eglQueryDevicesEXT,
+		"eglQueryDevicesEXT");
+
+	drmDevicePtr desired_drm_device;
+	int res = drmGetDevice(drm_fd, &desired_drm_device);
+	if(res < 0) {
+		wlr_log(WLR_ERROR, "drmGetDevice() failed for fd=%d with error code=%d", drm_fd, res);
+		return NULL;
+	}
+
+	EGLDeviceEXT devices[4];
+	int num_devices;
+	if(!egl->procs.eglQueryDevicesEXT(4, devices, &num_devices)) {
+		wlr_log(WLR_ERROR, "eglQueryDevicesEXT() failed");
+		return NULL;
+	}
+	EGLDeviceEXT chosen_device = NULL;
+
+	for(int i = 0; i < num_devices; i++) {
+		wlr_log(WLR_DEBUG, "Enumerating EGLDevice #%d at %p", i, devices[i]);
+		const char *device_exts_str =
+		egl->procs.eglQueryDeviceStringEXT(devices[i], EGL_EXTENSIONS);
+		if (device_exts_str == NULL) {
+			wlr_log(WLR_ERROR, "eglQueryDeviceStringEXT(EGL_EXTENSIONS) failed");
+			goto error;
+		}
+
+		wlr_log(WLR_INFO, "Supported EGL device extensions: %s", device_exts_str);
+
+		if (check_egl_ext(device_exts_str, "EGL_EXT_device_drm")) {
+			const char *device_file = egl->procs.eglQueryDeviceStringEXT(devices[i], EGL_DRM_DEVICE_FILE_EXT);
+			wlr_log(WLR_INFO, "device_file = %s", device_file);
+
+			if(device_has_name(desired_drm_device, device_file)) {
+				wlr_log(WLR_INFO, "found correct device EGL device");
+				chosen_device = devices[i];
+				break;
+			}
+		} else {
+			wlr_log(WLR_ERROR, "device does not support extension EGL_EXT_device_drm, skipping it");
+		}
+	}
+
+	if(!chosen_device) {
+		wlr_log(WLR_ERROR, "failed to find a suitable EGL device");
+		goto error;
+	}
+
+	egl->device = chosen_device;
+	wlr_log(WLR_INFO, "%p", chosen_device);
+
+	device_exts_str =
+		egl->procs.eglQueryDeviceStringEXT(egl->device, EGL_EXTENSIONS);
+	if (device_exts_str == NULL) {
+		wlr_log(WLR_ERROR, "eglQueryDeviceStringEXT(EGL_EXTENSIONS) failed");
+		goto error;
+	}
+
+	egl->exts.device_drm_ext =
+		check_egl_ext(device_exts_str, "EGL_EXT_device_drm");
+
+	egl->display = egl->procs.eglGetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT, egl->device, NULL);
 	if (egl->display == EGL_NO_DISPLAY) {
 		wlr_log(WLR_ERROR, "Failed to create EGL display");
 		goto error;
@@ -208,12 +278,16 @@ struct wlr_egl *wlr_egl_create(EGLenum platform, void *remote_display,
 		wlr_log(WLR_ERROR, "Failed to initialize EGL");
 		goto error;
 	}
+	wlr_log(WLR_INFO, "Using EGL %d.%d", (int)major, (int)minor);
+	wlr_log(WLR_INFO, "initialised EGL display");
+	wlr_log(WLR_INFO, "EGL vendor: %s", eglQueryString(egl->display, EGL_VENDOR));
 
 	const char *display_exts_str = eglQueryString(egl->display, EGL_EXTENSIONS);
 	if (display_exts_str == NULL) {
 		wlr_log(WLR_ERROR, "Failed to query EGL display extensions");
 		return NULL;
 	}
+	wlr_log(WLR_INFO, "Supported EGL display extensions: %s", display_exts_str);
 
 	if (check_egl_ext(display_exts_str, "EGL_KHR_image_base")) {
 		egl->exts.image_base_khr = true;
@@ -250,32 +324,6 @@ struct wlr_egl *wlr_egl_create(EGLenum platform, void *remote_display,
 			"eglQueryWaylandBufferWL");
 	}
 
-	const char *device_exts_str = NULL;
-	if (check_egl_ext(client_exts_str, "EGL_EXT_device_query")) {
-		load_egl_proc(&egl->procs.eglQueryDisplayAttribEXT,
-			"eglQueryDisplayAttribEXT");
-		load_egl_proc(&egl->procs.eglQueryDeviceStringEXT,
-			"eglQueryDeviceStringEXT");
-
-		EGLAttrib device_attrib;
-		if (!egl->procs.eglQueryDisplayAttribEXT(egl->display,
-				EGL_DEVICE_EXT, &device_attrib)) {
-			wlr_log(WLR_ERROR, "eglQueryDisplayAttribEXT(EGL_DEVICE_EXT) failed");
-			goto error;
-		}
-		egl->device = (EGLDeviceEXT)device_attrib;
-
-		device_exts_str =
-			egl->procs.eglQueryDeviceStringEXT(egl->device, EGL_EXTENSIONS);
-		if (device_exts_str == NULL) {
-			wlr_log(WLR_ERROR, "eglQueryDeviceStringEXT(EGL_EXTENSIONS) failed");
-			goto error;
-		}
-
-		egl->exts.device_drm_ext =
-			check_egl_ext(device_exts_str, "EGL_EXT_device_drm");
-	}
-
 	if (config_attribs != NULL) {
 		EGLint matched = 0;
 		if (!eglChooseConfig(egl->display, config_attribs, &egl->config, 1,
@@ -296,14 +344,6 @@ struct wlr_egl *wlr_egl_create(EGLenum platform, void *remote_display,
 		}
 		egl->config = EGL_NO_CONFIG_KHR;
 	}
-
-	wlr_log(WLR_INFO, "Using EGL %d.%d", (int)major, (int)minor);
-	wlr_log(WLR_INFO, "Supported EGL client extensions: %s", client_exts_str);
-	wlr_log(WLR_INFO, "Supported EGL display extensions: %s", display_exts_str);
-	if (device_exts_str != NULL) {
-		wlr_log(WLR_INFO, "Supported EGL device extensions: %s", device_exts_str);
-	}
-	wlr_log(WLR_INFO, "EGL vendor: %s", eglQueryString(egl->display, EGL_VENDOR));
 
 	init_dmabuf_formats(egl);
 
